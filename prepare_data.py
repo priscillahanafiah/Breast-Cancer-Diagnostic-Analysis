@@ -12,23 +12,25 @@ About the data (real, not simulated):
     compactness, concavity, concave points, symmetry, fractal dimension).
     The target is the diagnosis: malignant or benign.
 
-    Source: UCI Machine Learning Repository / Wisconsin Diagnostic Breast
-    Cancer (WDBC) dataset, originally from Dr. William H. Wolberg,
-    University of Wisconsin Hospitals. Distributed with scikit-learn
-    (`sklearn.datasets.load_breast_cancer`), so no download is required.
+Source: UCI Machine Learning Repository / Wisconsin Diagnostic Breast
+Cancer (WDBC) dataset, originally from Dr. William H. Wolberg,
+University of Wisconsin Hospitals. Distributed with scikit-learn
+(`sklearn.datasets.load_breast_cancer`), so no download is required.
 
-    Reference: W.N. Street, W.H. Wolberg and O.L. Mangasarian. "Nuclear
-    feature extraction for breast tumor diagnosis." IS&T/SPIE 1993
-    International Symposium on Electronic Imaging.
+Reference: W.N. Street, W.H. Wolberg and O.L. Mangasarian. "Nuclear
+feature extraction for breast tumor diagnosis." IS&T/SPIE 1993
+International Symposium on Electronic Imaging.
 
 Run:
     python prepare_data.py
+
 Output:
     data/breast_cancer_diagnostic.csv
 """
 
 from sklearn.datasets import load_breast_cancer
 import pandas as pd
+import os
 
 
 def prepare_dataset() -> pd.DataFrame:
@@ -41,12 +43,13 @@ def prepare_dataset() -> pd.DataFrame:
 
     # Tidy column names (spaces -> underscores) for easier use in code
     df.columns = [c.replace(" ", "_") for c in df.columns]
-
     return df
 
 
 if __name__ == "__main__":
+    os.makedirs("data", exist_ok=True)
     df = prepare_dataset()
     df.to_csv("data/breast_cancer_diagnostic.csv", index=False)
     print(f"Saved {len(df)} rows, {df.shape[1]} columns -> data/breast_cancer_diagnostic.csv")
     print(df["diagnosis"].value_counts())
+
