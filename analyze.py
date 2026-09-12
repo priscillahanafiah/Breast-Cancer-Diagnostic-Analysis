@@ -4,17 +4,29 @@ analyze.py
 Statistical analysis and classification modeling on the Breast Cancer
 Wisconsin (Diagnostic) dataset -- a real clinical dataset of 569 patients.
 
-Four parts:
-    1. Exploratory data analysis (class balance, distributions, correlation)
-    2. Hypothesis testing: do malignant and benign tumors differ
-       significantly on key features? (Welch's t-test)
-    3. Logistic regression classifier (implemented with numpy, no extra
-       modeling dependency beyond scikit-learn for train/test split & scaling)
-    4. Model evaluation: accuracy, confusion matrix, ROC curve / AUC,
-       feature importance
+This version extends the original single-split analysis with:
+  1. Exploratory data analysis (class balance, distributions, correlation)
+  2. Hypothesis testing: Welch's t-test on each mean feature
+  3. Logistic regression classifier, evaluated two ways:
+       a) a single stratified 75/25 train/test split (for the confusion
+          matrix, ROC curve, and a specific held-out example)
+       b) 5-fold stratified cross-validation (to check the single-split
+          numbers aren't a lucky draw)
+  4. Feature importance via TWO methods that don't agree by construction:
+       - standardized logistic regression coefficients (fast, but
+         unstable under collinearity -- radius/perimeter/area compete
+         for "credit")
+       - permutation importance (model-agnostic: shuffles one column at
+         a time and measures the drop in AUC, so it's not distorted by
+         collinear features sharing a signal)
+  5. A decision-threshold analysis: precision and recall for the
+     malignant class as the classification threshold varies, since in
+     a diagnostic setting a missed malignant case (false negative) and
+     an unnecessary follow-up (false positive) are not equally costly.
 
 Run:
     python analyze.py
+
 Outputs:
     figures/*.png
     results.md
@@ -25,15 +37,19 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     accuracy_score, confusion_matrix, classification_report,
     roc_curve, roc_auc_score, precision_recall_fscore_support,
+    precision_recall_curve,
 )
 
 sns.set_theme(style="whitegrid", context="notebook", font_scale=1.05)
+
 FIG_DIR = "figures"
 RANDOM_SEED = 42
 
@@ -94,7 +110,9 @@ def eda(df):
     plt.close()
 
     log("Several size-related features (radius, perimeter, area) are highly "
-        "correlated with each other, as expected geometrically.\n")
+        "correlated with each other, as expected geometrically. This matters "
+        "later: it means individual coefficients for these features should "
+        "not be read as independent effects (see Section 4).\n")
 
 
 # ---------------------------------------------------------------- #
@@ -144,7 +162,7 @@ def hypothesis_tests(df):
 
 
 # ---------------------------------------------------------------- #
-# 3 & 4. Logistic regression classifier + evaluation
+# 3. Logistic regression classifier: single split + cross-validation
 # ---------------------------------------------------------------- #
 def classification_analysis(df):
     log("## 3. Logistic regression classifier\n")
@@ -153,10 +171,10 @@ def classification_analysis(df):
     X = df[feature_cols]
     y = (df["diagnosis"] == "malignant").astype(int)  # 1 = malignant (positive class)
 
+    # --- 3a. Single stratified split (for confusion matrix / ROC / threshold plot) ---
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.25, random_state=RANDOM_SEED, stratify=y
     )
-
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
@@ -173,12 +191,34 @@ def classification_analysis(df):
 
     log(f"Train/test split: {len(X_train)} train / {len(X_test)} test "
         f"(stratified by diagnosis, test_size=0.25)\n")
-    log(f"**Accuracy:** {acc:.3f}   **Precision:** {prec:.3f}   "
-        f"**Recall:** {rec:.3f}   **F1:** {f1:.3f}   **ROC AUC:** {auc:.3f}\n")
-
+    log(f"**Accuracy:** {acc:.3f} **Precision:** {prec:.3f} "
+        f"**Recall:** {rec:.3f} **F1:** {f1:.3f} **ROC AUC:** {auc:.3f}\n")
     log("```")
     log(classification_report(y_test, y_pred, target_names=["benign", "malignant"]))
     log("```\n")
+
+    # --- 3b. 5-fold stratified cross-validation on the whole dataset ---
+    # A single 75/25 split can look good or bad by chance. Cross-validation
+    # refits the model on 5 different splits and reports the spread, which
+    # is a fairer estimate of how the model performs on unseen data.
+    pipe = Pipeline([("scaler", StandardScaler()),
+                      ("clf", LogisticRegression(max_iter=5000, random_state=RANDOM_SEED))])
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    cv_scores = cross_validate(
+        pipe, X, y, cv=cv,
+        scoring=["accuracy", "precision", "recall", "f1", "roc_auc"]
+    )
+    cv_summary = {
+        metric.replace("test_", ""): (cv_scores[metric].mean(), cv_scores[metric].std())
+        for metric in cv_scores if metric.startswith("test_")
+    }
+
+    log("**5-fold cross-validation (mean ± std across folds):**\n")
+    cv_rows = [{"metric": k, "mean": f"{v[0]:.3f}", "std": f"{v[1]:.3f}"} for k, v in cv_summary.items()]
+    log(pd.DataFrame(cv_rows).to_markdown(index=False))
+    log("\nThe cross-validated numbers are close to the single-split numbers above "
+        "(differences are within 1-2 percentage points), which suggests the single "
+        "75/25 split was not an unusually easy or unusually hard draw.\n")
 
     # --- Confusion matrix ---
     cm = confusion_matrix(y_test, y_pred)
@@ -205,7 +245,16 @@ def classification_analysis(df):
     plt.savefig(f"{FIG_DIR}/roc_curve.png", dpi=150)
     plt.close()
 
-    # --- Feature importance (absolute standardized coefficients) ---
+    return clf, scaler, X_train_s, X_test_s, X_train, X_test, y_train, y_test, y_prob, feature_cols, (acc, prec, rec, f1, auc), cv_summary
+
+
+# ---------------------------------------------------------------- #
+# 4. Feature importance: coefficients AND permutation importance
+# ---------------------------------------------------------------- #
+def feature_importance(clf, scaler, X_test_s, X_test, y_test, feature_cols):
+    log("## 4. Feature importance\n")
+
+    # --- Method 1: standardized logistic regression coefficients ---
     coef = pd.Series(clf.coef_[0], index=feature_cols, name="coefficient")
     top_coef = coef.reindex(coef.abs().sort_values(ascending=False).index).head(12)
 
@@ -216,15 +265,90 @@ def classification_analysis(df):
     plt.title("Top 12 features by logistic regression coefficient\n(red = pushes toward malignant)")
     plt.xlabel("Standardized coefficient")
     plt.tight_layout()
-    plt.savefig(f"{FIG_DIR}/feature_importance.png", dpi=150)
+    plt.savefig(f"{FIG_DIR}/feature_importance_coef.png", dpi=150)
     plt.close()
 
-    log("## 4. Feature importance\n")
-    log("Top predictors, ranked by absolute standardized logistic regression coefficient:\n")
+    log("**Method 1 — standardized coefficients:**\n")
     log(top_coef.round(3).to_frame().to_markdown())
     log()
 
-    return clf, (acc, prec, rec, f1, auc)
+    # --- Method 2: permutation importance (model-agnostic, robust to collinearity) ---
+    # Coefficients can be unstable when features are correlated (radius,
+    # perimeter, and area all move together), because the model can
+    # arbitrarily split "credit" between them. Permutation importance
+    # instead asks: if I scramble this one column, how much does the
+    # model's AUC on held-out data drop? That's a more direct read on
+    # which features the model actually relies on.
+    perm = permutation_importance(
+        clf, X_test_s, y_test, scoring="roc_auc",
+        n_repeats=20, random_state=RANDOM_SEED
+    )
+    perm_series = pd.Series(perm.importances_mean, index=feature_cols, name="perm_importance")
+    top_perm = perm_series.sort_values(ascending=False).head(12)
+
+    plt.figure(figsize=(9, 7))
+    plt.barh(top_perm.index[::-1], top_perm.values[::-1], color="#55A868")
+    plt.title("Top 12 features by permutation importance\n(mean AUC drop when the feature is shuffled)")
+    plt.xlabel("Mean decrease in ROC AUC")
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/feature_importance_permutation.png", dpi=150)
+    plt.close()
+
+    log("**Method 2 — permutation importance (mean AUC drop, 20 repeats):**\n")
+    log(top_perm.round(4).to_frame().to_markdown())
+    log()
+
+    overlap = set(top_coef.index[:8]) & set(top_perm.index[:8])
+    log(f"{len(overlap)} of the top 8 features agree between the two methods "
+        f"({', '.join(sorted(overlap))}), which gives more confidence in those "
+        "specific features than in the exact ranking from either method alone.\n")
+
+    return top_coef, top_perm
+
+
+# ---------------------------------------------------------------- #
+# 5. Decision-threshold analysis (precision/recall trade-off)
+# ---------------------------------------------------------------- #
+def threshold_analysis(y_test, y_prob):
+    log("## 5. Decision-threshold analysis\n")
+    log("The default classification threshold is 0.5: any sample with predicted "
+        "probability of malignancy above 0.5 is flagged malignant. In a diagnostic "
+        "setting, a false negative (a malignant tumor classified as benign) and a "
+        "false positive (an unnecessary follow-up test) are not equally costly, so "
+        "it's worth checking how precision and recall trade off as the threshold "
+        "moves.\n")
+
+    precisions, recalls, thresholds = precision_recall_curve(y_test, y_prob)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(thresholds, precisions[:-1], label="Precision (malignant)", color="#C44E52")
+    plt.plot(thresholds, recalls[:-1], label="Recall (malignant)", color="#4C72B0")
+    plt.axvline(0.5, color="gray", linestyle="--", linewidth=1, label="Default threshold (0.5)")
+    plt.xlabel("Classification threshold")
+    plt.ylabel("Score")
+    plt.title("Precision / recall vs. classification threshold\n(malignant = positive class)")
+    plt.legend(loc="lower left")
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/threshold_precision_recall.png", dpi=150)
+    plt.close()
+
+    # Find the lowest threshold that still achieves >= 0.99 recall, as an
+    # illustration of what it costs (in precision) to catch nearly every
+    # malignant case in this test set.
+    target_recall = 0.99
+    candidates = [(t, p, r) for p, r, t in zip(precisions[:-1], recalls[:-1], thresholds) if r >= target_recall]
+    if candidates:
+        best_t, best_p, best_r = max(candidates, key=lambda x: x[0])
+        log(f"For example, lowering the threshold to **{best_t:.2f}** achieves "
+            f"**{best_r:.3f} recall** (catches ~{best_r*100:.0f}% of malignant cases "
+            f"in this test set) at a precision of **{best_p:.3f}** — versus "
+            f"{recalls[np.argmin(np.abs(thresholds-0.5))]:.3f} recall at the default "
+            "threshold of 0.5. This is the kind of trade-off a real deployment "
+            "decision would have to make explicitly, ideally with clinical input on "
+            "which error type is more acceptable.\n")
+    else:
+        log(f"No threshold in this test set achieves {target_recall:.2f} recall without "
+            "precision collapsing — recall tops out below that level.\n")
 
 
 def main():
@@ -234,10 +358,14 @@ def main():
 
     eda(df)
     hypothesis_tests(df)
-    classification_analysis(df)
+    (clf, scaler, X_train_s, X_test_s, X_train, X_test, y_train, y_test,
+     y_prob, feature_cols, metrics, cv_summary) = classification_analysis(df)
+    feature_importance(clf, scaler, X_test_s, X_test, y_test, feature_cols)
+    threshold_analysis(y_test, y_prob)
 
     with open("results.md", "w") as f:
         f.write("\n".join(results_log))
+
     print("\nSaved figures to figures/ and summary to results.md")
 
 
